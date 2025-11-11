@@ -58,6 +58,15 @@ contract CLPTStablecoin is ERC20, AccessControl, Pausable {
     // permissioning
     mapping(address => bool) private _whitelist;
 
+    // Clave Única verification: if an address is marked as an individual, they must be verified
+    mapping(address => bool) public isIndividual;
+    mapping(address => bool) public verifiedClaveUnica;
+
+    event IsIndividualSet(address indexed who, bool isIndividual);
+    event IsIndividualBatchSet(address[] who, bool[] isIndividual);
+    event ClaveUnicaVerified(address indexed who, bool verified);
+    event ClaveUnicaVerifiedBatch(address[] who, bool[] verified);
+
     event Whitelisted(address indexed who);
     event Dewhitelisted(address indexed who);
 
@@ -106,6 +115,7 @@ contract CLPTStablecoin is ERC20, AccessControl, Pausable {
     function mint(uint _stablecoinAmount) external {
         require(_stablecoinAmount > 0, "Invalid stablecoin amount");
 
+        require(hasRole(MINTER_ROLE, msg.sender), "caller not minter");
         require(isWhitelisted(msg.sender), "sender not whitelisted");
 
         uint collateralAmount = calculateCollateralAmount(_stablecoinAmount);
@@ -117,11 +127,39 @@ contract CLPTStablecoin is ERC20, AccessControl, Pausable {
     function burn(uint _stablecoinAmount) external {
         require(_stablecoinAmount > 0, "Invalid stablecoin amount");
 
+        require(hasRole(BURNER_ROLE, msg.sender), "caller not burner");
         require(isWhitelisted(msg.sender), "sender not whitelisted");
 
         uint collateralAmount = calculateCollateralAmount(_stablecoinAmount);
         _burn(msg.sender, _stablecoinAmount);
         collateralToken.safeTransfer(msg.sender, collateralAmount);
+    }
+
+    // Clave Única management (KYC admin sets these flags on-chain after off-chain verification)
+    function setIsIndividual(address who, bool individual) external onlyRole(KYC_ADMIN_ROLE) {
+        isIndividual[who] = individual;
+        emit IsIndividualSet(who, individual);
+    }
+
+    function setIsIndividualBatch(address[] calldata who, bool[] calldata individuals) external onlyRole(KYC_ADMIN_ROLE) {
+        require(who.length == individuals.length, "len mismatch");
+        for (uint i = 0; i < who.length; i++) {
+            isIndividual[who[i]] = individuals[i];
+        }
+        emit IsIndividualBatchSet(who, individuals);
+    }
+
+    function setClaveUnicaVerified(address who, bool verified) external onlyRole(KYC_ADMIN_ROLE) {
+        verifiedClaveUnica[who] = verified;
+        emit ClaveUnicaVerified(who, verified);
+    }
+
+    function setClaveUnicaVerifiedBatch(address[] calldata who, bool[] calldata verified) external onlyRole(KYC_ADMIN_ROLE) {
+        require(who.length == verified.length, "len mismatch");
+        for (uint i = 0; i < who.length; i++) {
+            verifiedClaveUnica[who[i]] = verified[i];
+        }
+        emit ClaveUnicaVerifiedBatch(who, verified);
     }
 
     // Whitelist management
@@ -137,6 +175,43 @@ contract CLPTStablecoin is ERC20, AccessControl, Pausable {
 
     function isWhitelisted(address who) public view returns (bool) {
         return _whitelist[who];
+    }
+
+    // Freeze / unfreeze individual accounts (emergency tool)
+    mapping(address => bool) private _frozen;
+    event AccountFrozen(address indexed who);
+    event AccountUnfrozen(address indexed who);
+
+    function freezeAccount(address who) external onlyRole(GOVERNANCE_ROLE) {
+        _frozen[who] = true;
+        emit AccountFrozen(who);
+    }
+
+    function unfreezeAccount(address who) external onlyRole(GOVERNANCE_ROLE) {
+        _frozen[who] = false;
+        emit AccountUnfrozen(who);
+    }
+
+    function isFrozen(address who) public view returns (bool) {
+        return _frozen[who];
+    }
+
+    // Governance updates: collateral token and price feed
+    event CollateralTokenUpdated(address indexed oldToken, address indexed newToken);
+    event PriceFeedUpdated(address indexed oldFeed, address indexed newFeed);
+
+    function setCollateralToken(address newCollateral) external onlyRole(GOVERNANCE_ROLE) {
+        require(newCollateral != address(0), "invalid collateral");
+        address old = address(collateralToken);
+        collateralToken = IERC20(newCollateral);
+        emit CollateralTokenUpdated(old, newCollateral);
+    }
+
+    function setPriceFeed(address newPriceFeed) external onlyRole(GOVERNANCE_ROLE) {
+        require(newPriceFeed != address(0), "invalid price feed");
+        address old = address(priceFeed);
+        priceFeed = AggregatorV3Interface(newPriceFeed);
+        emit PriceFeedUpdated(old, newPriceFeed);
     }
 
     // Pausable
@@ -166,6 +241,23 @@ contract CLPTStablecoin is ERC20, AccessControl, Pausable {
         } else {
             // regular transfers require both parties whitelisted
             require(isWhitelisted(from) && isWhitelisted(to), "both parties must be whitelisted");
+        }
+
+        // Enforce Clave Única verification for any address marked as an individual.
+        // If an address is marked as individual, it must have been verified before participating.
+        if (from != address(0) && isIndividual[from]) {
+            require(verifiedClaveUnica[from], "sender must have Clave Unica verified");
+        }
+        if (to != address(0) && isIndividual[to]) {
+            require(verifiedClaveUnica[to], "recipient must have Clave Unica verified");
+        }
+
+        // Prevent transfers for frozen accounts
+        if (from != address(0)) {
+            require(!_frozen[from], "sender frozen");
+        }
+        if (to != address(0)) {
+            require(!_frozen[to], "recipient frozen");
         }
 
         super._update(from, to, value);
