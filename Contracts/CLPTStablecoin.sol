@@ -4,17 +4,33 @@ pragma solidity ^0.8.13;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Snapshot.sol";
+import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
-contract CLPTStablecoin is ERC20 {
-    using SafeMath for uint256;
+contract CLPTStablecoin is ERC20, AccessControl, Pausable, ERC20Snapshot {
+    using SafeERC20 for IERC20;
+
+    bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+    bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant KYC_ADMIN_ROLE = keccak256("KYC_ADMIN_ROLE");
+    bytes32 public constant AUDITOR_ROLE = keccak256("AUDITOR_ROLE");
 
     address public admin;
     IERC20 public collateralToken;
     AggregatorV3Interface public priceFeed;
 
     uint public constant COLLATERAL_DECIMAL = 1e6;
+
+    // permissioning
+    mapping(address => bool) private _whitelist;
+
+    event Whitelisted(address indexed who);
+    event Dewhitelisted(address indexed who);
 
     constructor(
         address _collateralToken,
@@ -29,6 +45,19 @@ contract CLPTStablecoin is ERC20 {
         admin = msg.sender;
         collateralToken = IERC20(_collateralToken);
         priceFeed = AggregatorV3Interface(_pricefeed);
+
+        // setup roles
+        _setupRole(DEFAULT_ADMIN_ROLE, admin);
+        _setupRole(GOVERNANCE_ROLE, admin);
+        _setupRole(MINTER_ROLE, admin);
+        _setupRole(BURNER_ROLE, admin);
+        _setupRole(PAUSER_ROLE, admin);
+        _setupRole(KYC_ADMIN_ROLE, admin);
+        _setupRole(AUDITOR_ROLE, admin);
+
+        // by default whitelist admin
+        _whitelist[admin] = true;
+        emit Whitelisted(admin);
     }
 
     function getCollateralPrice() public view returns (uint) {
@@ -41,18 +70,17 @@ contract CLPTStablecoin is ERC20 {
         uint _stablecoinAmount
     ) public view returns (uint) {
         uint collateralprice = getCollateralPrice();
-        return _stablecoinAmount.mul(COLLATERAL_DECIMAL).div(collateralprice);
+        // SafeMath is not required in Solidity ^0.8.x (built-in overflow checks)
+        return (_stablecoinAmount * COLLATERAL_DECIMAL) / collateralprice;
     }
 
     function mint(uint _stablecoinAmount) external {
         require(_stablecoinAmount > 0, "Invalid stablecoin amount");
 
+        require(isWhitelisted(msg.sender), "sender not whitelisted");
+
         uint collateralAmount = calculateCollateralAmount(_stablecoinAmount);
-        collateralToken.transferFrom(
-            msg.sender,
-            address(this),
-            collateralAmount
-        );
+        collateralToken.safeTransferFrom(msg.sender, address(this), collateralAmount);
 
         _mint(msg.sender, _stablecoinAmount);
     }
@@ -60,8 +88,69 @@ contract CLPTStablecoin is ERC20 {
     function burn(uint _stablecoinAmount) external {
         require(_stablecoinAmount > 0, "Invalid stablecoin amount");
 
+        require(isWhitelisted(msg.sender), "sender not whitelisted");
+
         uint collateralAmount = calculateCollateralAmount(_stablecoinAmount);
         _burn(msg.sender, _stablecoinAmount);
-        collateralToken.transfer(msg.sender, collateralAmount);
+        collateralToken.safeTransfer(msg.sender, collateralAmount);
+    }
+
+    // Whitelist management
+    function addToWhitelist(address who) external onlyRole(KYC_ADMIN_ROLE) {
+        _whitelist[who] = true;
+        emit Whitelisted(who);
+    }
+
+    function removeFromWhitelist(address who) external onlyRole(KYC_ADMIN_ROLE) {
+        _whitelist[who] = false;
+        emit Dewhitelisted(who);
+    }
+
+    function isWhitelisted(address who) public view returns (bool) {
+        return _whitelist[who];
+    }
+
+    // Pausable
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    // Snapshot for auditors / reporting
+    function snapshot() external onlyRole(AUDITOR_ROLE) returns (uint256) {
+        return _snapshot();
+    }
+
+    // Override hooks to enforce whitelist and pausability
+    function _beforeTokenTransfer(address from, address to, uint256 amount)
+        internal
+        override(ERC20, ERC20Snapshot)
+    {
+        super._beforeTokenTransfer(from, to, amount);
+
+        require(!paused(), "token transfer while paused");
+
+        // allow minting (from == 0) only if recipient whitelisted
+        if (from == address(0)) {
+            require(isWhitelisted(to), "recipient not whitelisted");
+            return;
+        }
+
+        // allow burning (to == 0) only if sender whitelisted
+        if (to == address(0)) {
+            require(isWhitelisted(from), "sender not whitelisted");
+            return;
+        }
+
+        // regular transfers require both parties whitelisted
+        require(isWhitelisted(from) && isWhitelisted(to), "both parties must be whitelisted");
+    }
+
+    // AccessControl support
+    function supportsInterface(bytes4 interfaceId) public view virtual override(AccessControl) returns (bool) {
+        return AccessControl.supportsInterface(interfaceId);
     }
 }
