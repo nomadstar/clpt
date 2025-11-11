@@ -6,13 +6,42 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
-import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Snapshot.sol";
 import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
-contract CLPTStablecoin is ERC20, AccessControl, Pausable, ERC20Snapshot {
-    using SafeERC20 for IERC20;
+/// Minimal local Pausable implementation to avoid external import resolution issues.
+/// Matches the subset of OpenZeppelin Pausable used in this contract:
+/// - paused()
+/// - _pause()
+/// - _unpause()
+abstract contract Pausable {
+    event Paused(address account);
+    event Unpaused(address account);
 
+    bool private _paused;
+
+    constructor() {
+        _paused = false;
+    }
+
+    function paused() public view virtual returns (bool) {
+        return _paused;
+    }
+
+    function _pause() internal virtual {
+        require(!_paused, "Pausable: paused");
+        _paused = true;
+        emit Paused(msg.sender);
+    }
+
+    function _unpause() internal virtual {
+        require(_paused, "Pausable: not paused");
+        _paused = false;
+        emit Unpaused(msg.sender);
+    }
+}
+
+contract CLPTStablecoin is ERC20, AccessControl, Pausable {
+    using SafeERC20 for IERC20;
     bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
     bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
@@ -46,15 +75,15 @@ contract CLPTStablecoin is ERC20, AccessControl, Pausable, ERC20Snapshot {
         collateralToken = IERC20(_collateralToken);
         priceFeed = AggregatorV3Interface(_pricefeed);
 
-        // setup roles
-        _setupRole(DEFAULT_ADMIN_ROLE, admin);
-        _setupRole(GOVERNANCE_ROLE, admin);
-        _setupRole(MINTER_ROLE, admin);
-        _setupRole(BURNER_ROLE, admin);
-        _setupRole(PAUSER_ROLE, admin);
-        _setupRole(KYC_ADMIN_ROLE, admin);
-        _setupRole(AUDITOR_ROLE, admin);
-
+    // setup roles (grant initial roles to admin)
+    bool _ok;
+    _ok = _grantRole(DEFAULT_ADMIN_ROLE, admin);
+    _ok = _grantRole(GOVERNANCE_ROLE, admin);
+    _ok = _grantRole(MINTER_ROLE, admin);
+    _ok = _grantRole(BURNER_ROLE, admin);
+    _ok = _grantRole(PAUSER_ROLE, admin);
+    _ok = _grantRole(KYC_ADMIN_ROLE, admin);
+    _ok = _grantRole(AUDITOR_ROLE, admin);
         // by default whitelist admin
         _whitelist[admin] = true;
         emit Whitelisted(admin);
@@ -120,33 +149,26 @@ contract CLPTStablecoin is ERC20, AccessControl, Pausable, ERC20Snapshot {
     }
 
     // Snapshot for auditors / reporting
-    function snapshot() external onlyRole(AUDITOR_ROLE) returns (uint256) {
-        return _snapshot();
+    // Snapshot for auditors / reporting
+    function snapshot() external view onlyRole(AUDITOR_ROLE) returns (uint256) {
+        revert("Snapshot not supported in this build");
     }
-
-    // Override hooks to enforce whitelist and pausability
-    function _beforeTokenTransfer(address from, address to, uint256 amount)
-        internal
-        override(ERC20, ERC20Snapshot)
-    {
-        super._beforeTokenTransfer(from, to, amount);
-
+    // Override ERC20._update to enforce whitelist and pausability in OpenZeppelin v5
+    function _update(address from, address to, uint256 value) internal override {
         require(!paused(), "token transfer while paused");
 
         // allow minting (from == 0) only if recipient whitelisted
         if (from == address(0)) {
             require(isWhitelisted(to), "recipient not whitelisted");
-            return;
-        }
-
-        // allow burning (to == 0) only if sender whitelisted
-        if (to == address(0)) {
+        } else if (to == address(0)) {
+            // burning
             require(isWhitelisted(from), "sender not whitelisted");
-            return;
+        } else {
+            // regular transfers require both parties whitelisted
+            require(isWhitelisted(from) && isWhitelisted(to), "both parties must be whitelisted");
         }
 
-        // regular transfers require both parties whitelisted
-        require(isWhitelisted(from) && isWhitelisted(to), "both parties must be whitelisted");
+        super._update(from, to, value);
     }
 
     // AccessControl support
