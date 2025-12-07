@@ -3,7 +3,7 @@
     "target": "ES2020",
     "module": "CommonJS",
     "outDir": "dist",
-    "rootDir": "src",
+    "rootDir": ".",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -14,6 +14,9 @@
   ,
   "include": [
     "src/**/*",
-    "__tests__/**/*"
-  ]
+    "__tests__/**/*",
+    "prisma/**/*",
+    "Contracts/**/*"
+  ],
+  "exclude": ["node_modules", "dist"]
 }
