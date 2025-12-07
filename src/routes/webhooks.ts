@@ -12,10 +12,13 @@ router.post('/blockchain', async (req, res, next) => {
 
     // if updated, find merchant and call callback
     if (result.updated && paymentIntentId) {
-      const pi = await (await import('../repositories/paymentIntentRepo')).getPaymentIntentById(paymentIntentId);
-      const merchant = await getMerchantById(pi.merchantId);
-      if (merchant?.callbackUrl) {
-        dispatchMerchantCallback(merchant.callbackUrl, { paymentIntentId: pi.id, status: 'PAID', txHash });
+      const { getPaymentIntentById } = await import('../repositories/paymentIntentRepo');
+      const pi = await getPaymentIntentById(paymentIntentId);
+      if (pi) {
+        const merchant = await getMerchantById(pi.merchantId);
+        if (merchant?.callbackUrl) {
+          dispatchMerchantCallback(merchant.callbackUrl, { paymentIntentId: pi.id, status: 'PAID', txHash });
+        }
       }
     }
 
