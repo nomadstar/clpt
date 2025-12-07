@@ -11,6 +11,7 @@ model Merchant {
   id                    String   @id @default(uuid())
   name                  String
   clpnyReceivingAddress String
+  apiKey                String   @unique
   callbackUrl           String?  
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
