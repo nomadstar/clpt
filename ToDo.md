@@ -1,6 +1,6 @@
 # ToDo: Compatibilidad con entidades chilenas (bancos, SII, reguladores)
 
-Resumen: acciones necesarias para que la stablecoin `CLPT` cumpla con requisitos regulatorios y operativos en Chile.
+Resumen: acciones necesarias para que la stablecoin `CLPNY` (Chilean Penny) cumpla con requisitos regulatorios y operativos en Chile.
 
 - [ ] Definir requisitos regulatorios y de integración
 	- Reunir requisitos KYC/AML, reporting SII, conciliación bancaria y acuerdos con custodios.

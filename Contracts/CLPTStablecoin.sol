@@ -48,6 +48,7 @@ contract CLPTStablecoin is ERC20, AccessControl, Pausable {
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
     bytes32 public constant KYC_ADMIN_ROLE = keccak256("KYC_ADMIN_ROLE");
     bytes32 public constant AUDITOR_ROLE = keccak256("AUDITOR_ROLE");
+    bytes32 public constant VASP_ROLE = keccak256("VASP_ROLE");
 
     address public admin;
     IERC20 public collateralToken;
@@ -58,6 +59,24 @@ contract CLPTStablecoin is ERC20, AccessControl, Pausable {
     // permissioning
     mapping(address => bool) private _whitelist;
 
+    // kyc reference (hash) per address (immutable once set by KYC admin)
+    mapping(address => bytes32) public kycRefHash;
+
+    // kyc tier per address (1..3)
+    mapping(address => uint8) public kycTier;
+
+    // Tax handling for Chilean law: withhold a percentage when an Individual pays a Company
+    enum TaxCategory { Unknown, Individual, Company }
+    mapping(address => TaxCategory) public taxCategory;
+    address public siiTreasury;
+    uint256 public taxPercent = 19; // default 19%
+
+    event TaxCategorySet(address indexed who, TaxCategory category);
+    event TaxCategoryBatchSet(address[] who, TaxCategory[] categories);
+    event SiiTreasurySet(address indexed treasury);
+    event TaxPercentSet(uint256 percent);
+    event TaxWithheld(address indexed from, address indexed to, uint256 amount);
+
     // Clave Única verification: if an address is marked as an individual, they must be verified
     mapping(address => bool) public isIndividual;
     mapping(address => bool) public verifiedClaveUnica;
@@ -66,14 +85,31 @@ contract CLPTStablecoin is ERC20, AccessControl, Pausable {
     event IsIndividualBatchSet(address[] who, bool[] isIndividual);
     event ClaveUnicaVerified(address indexed who, bool verified);
     event ClaveUnicaVerifiedBatch(address[] who, bool[] verified);
+    event KycRefHashSet(address indexed who, bytes32 kycRefHash);
+    event KycTierSet(address indexed who, uint8 tier);
 
     event Whitelisted(address indexed who);
     event Dewhitelisted(address indexed who);
+        event TransferExtended(
+            address indexed from,
+            address indexed to,
+            uint256 value,
+            bytes32 kycRefHashFrom,
+            bytes32 kycRefHashTo,
+            uint8 operationType,
+            string taxPeriodId,
+            bytes32 travelRuleRef,
+            uint256 snapshotIdOpt
+        );
+
+        event DisputeRaised(bytes32 indexed caseIdHash, address indexed who, uint256 amount, address indexed raisedBy);
+        event DisputeResolved(bytes32 indexed caseIdHash, address indexed who, uint256 amount, string resolution, address indexed resolvedBy);
+        event AccountFrozenWithCase(address indexed who, bytes32 caseIdHash);
 
     constructor(
         address _collateralToken,
         address _pricefeed
-    ) ERC20("Chilean Pesos Token", "CLPT") {
+    ) ERC20("Chilean Penny", "CLPNY") {
         require(
             _collateralToken != address(0),
             "Invalid collateral token address"
@@ -162,6 +198,47 @@ contract CLPTStablecoin is ERC20, AccessControl, Pausable {
         emit ClaveUnicaVerifiedBatch(who, verified);
     }
 
+    // KYC ref hash and tier management
+    function setKycRefHash(address who, bytes32 refHash) external onlyRole(KYC_ADMIN_ROLE) {
+        require(who != address(0), "invalid addr");
+        require(kycRefHash[who] == bytes32(0), "kycRefHash already set");
+        kycRefHash[who] = refHash;
+        emit KycRefHashSet(who, refHash);
+    }
+
+    function setKycTier(address who, uint8 tier) external onlyRole(KYC_ADMIN_ROLE) {
+        require(who != address(0), "invalid addr");
+        require(tier >= 1 && tier <= 3, "tier out of range");
+        kycTier[who] = tier;
+        emit KycTierSet(who, tier);
+    }
+
+    // Tax category management (KYC admin sets category after verification)
+    function setTaxCategory(address who, TaxCategory category) external onlyRole(KYC_ADMIN_ROLE) {
+        taxCategory[who] = category;
+        emit TaxCategorySet(who, category);
+    }
+
+    function setTaxCategoryBatch(address[] calldata who, TaxCategory[] calldata categories) external onlyRole(KYC_ADMIN_ROLE) {
+        require(who.length == categories.length, "len mismatch");
+        for (uint i = 0; i < who.length; i++) {
+            taxCategory[who[i]] = categories[i];
+        }
+        emit TaxCategoryBatchSet(who, categories);
+    }
+
+    function setSiiTreasury(address treasury) external onlyRole(GOVERNANCE_ROLE) {
+        require(treasury != address(0), "invalid treasury");
+        siiTreasury = treasury;
+        emit SiiTreasurySet(treasury);
+    }
+
+    function setTaxPercent(uint256 percent) external onlyRole(GOVERNANCE_ROLE) {
+        require(percent <= 100, "percent>100");
+        taxPercent = percent;
+        emit TaxPercentSet(percent);
+    }
+
     // Whitelist management
     function addToWhitelist(address who) external onlyRole(KYC_ADMIN_ROLE) {
         _whitelist[who] = true;
@@ -182,9 +259,10 @@ contract CLPTStablecoin is ERC20, AccessControl, Pausable {
     event AccountFrozen(address indexed who);
     event AccountUnfrozen(address indexed who);
 
-    function freezeAccount(address who) external onlyRole(GOVERNANCE_ROLE) {
+    function freezeAccount(address who, bytes32 caseIdHash) external onlyRole(GOVERNANCE_ROLE) {
         _frozen[who] = true;
         emit AccountFrozen(who);
+        emit AccountFrozenWithCase(who, caseIdHash);
     }
 
     function unfreezeAccount(address who) external onlyRole(GOVERNANCE_ROLE) {
@@ -260,7 +338,69 @@ contract CLPTStablecoin is ERC20, AccessControl, Pausable {
             require(!_frozen[to], "recipient frozen");
         }
 
+        // Tax withholding: if sender is Individual and recipient is Company,
+        // withhold `taxPercent` percent to `siiTreasury` (must be set and whitelisted).
+        if (from != address(0) && to != address(0) && taxPercent > 0) {
+            if (taxCategory[from] == TaxCategory.Individual && taxCategory[to] == TaxCategory.Company) {
+                require(siiTreasury != address(0), "SII treasury not configured");
+                require(isWhitelisted(siiTreasury), "SII treasury not whitelisted");
+                uint256 taxAmount = (value * taxPercent) / 100;
+                if (taxAmount > 0) {
+                    // transfer tax to treasury, then remaining to recipient
+                    // note: both transfers run through _update and will re-run checks (whitelist, paused, etc.)
+                    super._update(from, siiTreasury, taxAmount);
+                    super._update(from, to, value - taxAmount);
+                    emit TaxWithheld(from, to, taxAmount);
+                    return;
+                }
+            }
+        }
+
         super._update(from, to, value);
+    }
+
+    // ----- Metadata-enabled operations -----
+    // transfer with operationType, taxPeriodId and travelRuleRef. Can be called by the `from` address
+    // or by an authorized `VASP_ROLE` (custodios/PSP)
+    function transferWithMetadata(
+        address from,
+        address to,
+        uint256 value,
+        uint8 operationType,
+        string calldata taxPeriodId,
+        bytes32 travelRuleRef,
+        uint256 snapshotIdOpt
+    ) external {
+        require(from != address(0) && to != address(0), "invalid addr");
+        require(msg.sender == from || hasRole(VASP_ROLE, msg.sender), "not authorized");
+        // perform transfer using internal _update
+        super._update(from, to, value);
+        emit TransferExtended(from, to, value, kycRefHash[from], kycRefHash[to], operationType, taxPeriodId, travelRuleRef, snapshotIdOpt);
+    }
+
+    // mint with metadata - only MINTER_ROLE
+    function mintWithMetadata(address to, uint256 amount, uint8 operationType, string calldata taxPeriodId, bytes32 travelRuleRef) external onlyRole(MINTER_ROLE) {
+        require(to != address(0), "invalid to");
+        require(isWhitelisted(to), "recipient not whitelisted");
+        _mint(to, amount);
+        emit TransferExtended(address(0), to, amount, bytes32(0), kycRefHash[to], operationType, taxPeriodId, travelRuleRef, 0);
+    }
+
+    // burn with metadata - only BURNER_ROLE
+    function burnWithMetadata(address from, uint256 amount, uint8 operationType, string calldata taxPeriodId, bytes32 travelRuleRef) external onlyRole(BURNER_ROLE) {
+        require(from != address(0), "invalid from");
+        require(isWhitelisted(from), "sender not whitelisted");
+        _burn(from, amount);
+        emit TransferExtended(from, address(0), amount, kycRefHash[from], bytes32(0), operationType, taxPeriodId, travelRuleRef, 0);
+    }
+
+    // Dispute handling
+    function raiseDispute(bytes32 caseIdHash, address who, uint256 amount) external onlyRole(AUDITOR_ROLE) {
+        emit DisputeRaised(caseIdHash, who, amount, msg.sender);
+    }
+
+    function resolveDispute(bytes32 caseIdHash, address who, uint256 amount, string calldata resolution) external onlyRole(AUDITOR_ROLE) {
+        emit DisputeResolved(caseIdHash, who, amount, resolution, msg.sender);
     }
 
     // AccessControl support
